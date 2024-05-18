@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from base_bert import BertPreTrainedModel
 from utils import *
-
+import math
 
 class BertSelfAttention(nn.Module):
   def __init__(self, config):
@@ -50,12 +50,15 @@ class BertSelfAttention(nn.Module):
     #   [bs, seq_len, num_attention_heads * attention_head_size = hidden_size].
 
     ### TODO
-    B, _, n, ahs = key.size()
-    S = torch.matmul(query, key.transpose(-1, -2)) / ahs**0.5
-    S += attention_mask
-    weight = F.softmax(S, dim=-1)
-    V_ = torch.matmul(weight, value).transpose(1, 2).contiguous()
-    return V_.view(B, n, -1)
+    attention_score = torch.matmul(query, key.transpose(-1, -2))
+    attention_score = attention_score + attention_mask
+    attention_score = attention_score / math.sqrt(self.attention_head_size)
+    attention_score = F.softmax(attention_score, dim=-1)
+    attention_score = self.dropout(attention_score)
+    attention_value = torch.matmul(attention_score, value)
+    attention_value = attention_value.transpose(1, 2).contiguous()
+    attention_value = attention_value.view(attention_value.shape[0], attention_value.shape[1], self.all_head_size)
+    return attention_value
 
 
   def forward(self, hidden_states, attention_mask):
@@ -104,12 +107,9 @@ class BertLayer(nn.Module):
     # Hint: Remember that BERT applies dropout to the transformed output of each sub-layer,
     # before it is added to the sub-layer input and normalized with a layer norm.
     ### TODO
-    output = dense_layer(output)
-    output = dropout(output)
-    out = input + output
+    out = input + dense_layer(dropout(output))
     out = ln_layer(out)
     return out
-
 
   def forward(self, hidden_states, attention_mask):
     """
@@ -178,10 +178,10 @@ class BertModel(BertPreTrainedModel):
 
     # Add three embeddings together; then apply embed_layer_norm and dropout and return.
     ### TODO
-    embeddings = inputs_embeds + pos_embeds + tk_type_embeds
-    embed_layer = self.embed_layer_norm(embeddings)
-    dropout = self.embed_dropout(embed_layer)
-    return dropout
+    embeds = inputs_embeds + pos_embeds + tk_type_embeds
+    embeds = self.embed_layer_norm(embeds)
+    embeds = self.embed_dropout(embeds)
+    return embeds
 
 
   def encode(self, hidden_states, attention_mask):
