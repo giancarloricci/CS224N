@@ -471,8 +471,8 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
     # Save path.
-    args.intermediate_eval = args.intermediate_eval == "false"
-    args.intermediate_eval = args.intermediate_eval == "true"
+    args.intermediate_eval = args.intermediate_eval.lower() == "true"
+    args.use_smart = args.intermediate_eval.lower() == "true"
 
     args.filepath = f'{args.fine_tune_mode}-{args.epochs}-{args.lr}-multitask.pt'
     seed_everything(args.seed)  # Fix the seed for reproducibility.
