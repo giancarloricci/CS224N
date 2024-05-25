@@ -26,6 +26,8 @@ from bert import BertModel
 from optimizer import AdamW
 from tqdm import tqdm
 
+from tokenizer import BertTokenizer
+
 from datasets import (
     SentenceClassificationDataset,
     SentenceClassificationTestDataset,
@@ -105,6 +107,17 @@ class MultitaskBERT(nn.Module):
         out = self.ln_sentiment(out)
         return out
 
+    def combined_inputs(self, input_ids_1, attention_mask_1,
+                        input_ids_2, attention_mask_2):
+        sep_token_id = torch.tensor(
+            [self.tokenizer.sep_token_id], dtype=torch.long, device=input_ids_1.device)
+        batch_sep_token_id = sep_token_id.repeat(input_ids_1.shape[0], 1)
+        input_id = torch.cat(
+            (input_ids_1, batch_sep_token_id, input_ids_2, batch_sep_token_id), dim=1)
+        attention_mask = torch.cat((attention_mask_1, torch.ones_like(
+            batch_sep_token_id), attention_mask_2, torch.ones_like(batch_sep_token_id)), dim=1)
+        return input_id, attention_mask
+
     def predict_paraphrase(self,
                            input_ids_1, attention_mask_1,
                            input_ids_2, attention_mask_2):
@@ -112,9 +125,9 @@ class MultitaskBERT(nn.Module):
         Note that your output should be unnormalized (a logit); it will be passed to the sigmoid function
         during evaluation.
         '''
-        out1 = self.forward(input_ids_1, attention_mask_1)
-        out2 = self.forward(input_ids_2, attention_mask_2)
-        out = out1 + out2
+        input_id, attention_mask = self.combined_inputs(
+            input_ids_1, attention_mask_1, input_ids_2, attention_mask_2)
+        out = self.forward(input_id, attention_mask)
         return self.ln_paraphrase(out)
 
     def predict_similarity(self,
@@ -123,10 +136,10 @@ class MultitaskBERT(nn.Module):
         '''Given a batch of pairs of sentences, outputs a single logit corresponding to how similar they are.
         Note that your output should be unnormalized (a logit).
         '''
-        out1 = self.forward(input_ids_1, attention_mask_1)
-        out2 = self.forward(input_ids_2, attention_mask_2)
-        out = out1 + out2
-        return F.relu(self.ln_similarity(out))
+        input_id, attention_mask = self.combined_inputs(
+            input_ids_1, attention_mask_1, input_ids_2, attention_mask_2)
+        out = self.forward(input_id, attention_mask)
+        return self.ln_similarity(out)
 
 
 def save_model(model, optimizer, args, config, filepath):
