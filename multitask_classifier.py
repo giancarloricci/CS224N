@@ -27,6 +27,7 @@ from optimizer import AdamW
 from tqdm import tqdm
 
 from tokenizer import BertTokenizer
+from smart_regularization import smart_regularization
 
 from datasets import (
     SentenceClassificationDataset,
@@ -92,8 +93,8 @@ class MultitaskBERT(nn.Module):
         # Here, you can start by just returning the embeddings straight from BERT.
         # When thinking of improvements, you can later try modifying this
         # (e.g., by adding other layers).
-        out = self.bert.forward(input_ids=input_ids,
-                                attention_mask=attention_mask)
+        out = self.bert(input_ids=input_ids,
+                        attention_mask=attention_mask)
         out = out["pooler_output"]
         out = self.dropout(out)
         return out
@@ -123,7 +124,7 @@ class MultitaskBERT(nn.Module):
                            input_ids_1, attention_mask_1,
                            input_ids_2, attention_mask_2):
         '''Given a batch of pairs of sentences, outputs a single logit for predicting whether they are paraphrases.
-        Note that your output should be unnormalized (a logit); it will be passed to the sigmoid function
+        Note that your output should be unnormaalized (a logit); it will be passed to the sigmoid function
         during evaluation.
         '''
         input_id, attention_mask = self.combined_inputs(
@@ -159,11 +160,13 @@ def save_model(model, optimizer, args, config, filepath):
 
 
 class Task:
-    def __init__(self, dataloader, predictor, loss_function, input_function):
+    def __init__(self, dataloader, predictor, loss_function, single_sentence, linear_layer):
         self.dataloader = dataloader
         self.predictor = predictor
         self.loss_function = loss_function
-        self.input_function = input_function
+        self.single_sentence = single_sentence
+        self.linear_layer = linear_layer
+
 
 def train_multitask(args):
     '''Train MultitaskBERT.
@@ -241,7 +244,8 @@ def train_multitask(args):
         model.predict_sentiment,
         lambda logits, b_labels: F.cross_entropy(
             logits, b_labels.view(-1), reduction='sum') / args.batch_size,
-        lambda b: get_input_labels(b, True)
+        True,
+        model.ln_sentiment
     )
 
     task_para = Task(
@@ -249,7 +253,8 @@ def train_multitask(args):
         model.predict_paraphrase,
         lambda logits, b_labels: F.binary_cross_entropy_with_logits(
             logits.view(-1), b_labels.float(), reduction='sum') / args.batch_size,
-        lambda b: get_input_labels(b, False)
+        False,
+        model.ln_paraphrase
     )
 
     task_sts = Task(
@@ -257,7 +262,8 @@ def train_multitask(args):
         model.predict_similarity,
         lambda logits, b_labels: F.mse_loss(
             logits.view(-1), b_labels.view(-1).float(), reduction='sum') / args.batch_size,
-        lambda b: get_input_labels(b, False)
+        False,
+        model.ln_similarity
     )
 
     tasks = [task_sst, task_para, task_sts]
@@ -272,10 +278,19 @@ def train_multitask(args):
             for batch in tqdm(task.dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
 
                 optimizer.zero_grad()
-                predict_args, b_labels = task.input_function(batch)
+                predict_args, b_labels = get_input_labels(
+                    batch, task.single_sentence)
                 logits = task.predictor(*predict_args)
-
                 loss = task.loss_function(logits, b_labels)
+
+                if args.use_smart:
+                    x = predict_args if task.single_sentence else model.combined_inputs(
+                        *predict_args)
+                    embeddings = model.forward(*x)
+                    logits = task.linear_layer(embeddings)
+                    loss = smart_regularization(
+                        loss, embeddings, logits, task.linear_layer)
+
                 optimizer.step()
 
                 train_loss += loss.item()
@@ -444,7 +459,10 @@ def get_args():
                         help="learning rate", default="False")
 
     parser.add_argument("--intermediate_eval", type=str,
-                        help="learning rate", default="False")
+                        help="evaluate every epoch", default="False")
+
+    parser.add_argument("--use_smart", type=str,
+                        help="use SMART optimization", default="True")
 
     args = parser.parse_args()
     return args
@@ -454,6 +472,8 @@ if __name__ == "__main__":
     args = get_args()
     # Save path.
     args.intermediate_eval = args.intermediate_eval == "false"
+    args.intermediate_eval = args.intermediate_eval == "true"
+
     args.filepath = f'{args.fine_tune_mode}-{args.epochs}-{args.lr}-multitask.pt'
     seed_everything(args.seed)  # Fix the seed for reproducibility.
     train_multitask(args)
