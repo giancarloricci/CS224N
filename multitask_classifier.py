@@ -26,6 +26,8 @@ from bert import BertModel
 from optimizer import AdamW
 from tqdm import tqdm
 
+from gradient_surgery import PCGrad
+
 from tokenizer import BertTokenizer
 from smart_regularization import smart_regularization
 
@@ -239,6 +241,9 @@ def train_multitask(args):
     lr = args.lr
     optimizer = AdamW(model.parameters(), lr=lr)
 
+    if args.gradient_surgery:
+        optimizer = PCGrad(optimizer)
+
     task_sst = Task(
         sst_train_dataloader,
         model.predict_sentiment,
@@ -267,34 +272,60 @@ def train_multitask(args):
     )
 
     tasks = [task_sst, task_para, task_sts]
-
+    num_tasks = len(tasks)
     best_dev_acc = 0
-    # Run for the specified number of epochs.
+
+    def apply_smart(task, predict_args, logits, b_labels, model):
+        if args.use_smart:
+            x = predict_args if task.single_sentence else model.combined_inputs(*predict_args)
+            embeddings = model.forward(*x)
+            logits = task.linear_layer(embeddings)
+            loss = smart_regularization(task.loss_function(logits, b_labels), embeddings, logits, task.linear_layer)
+            return loss
+        else:
+            return task.loss_function(logits, b_labels)
+
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0
         num_batches = 0
-        for task in tasks:
-            for batch in tqdm(task.dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
 
-                optimizer.zero_grad()
-                predict_args, b_labels = get_input_labels(
-                    batch, task.single_sentence)
-                logits = task.predictor(*predict_args)
-                loss = task.loss_function(logits, b_labels)
+        if args.gradient_surgery:
+            min_batches = min(len(task.dataloader) for task in tasks)
+            dataloader_iters = [iter(task.dataloader) for task in tasks]
 
-                if args.use_smart:
-                    x = predict_args if task.single_sentence else model.combined_inputs(
-                        *predict_args)
-                    embeddings = model.forward(*x)
-                    logits = task.linear_layer(embeddings)
-                    loss = smart_regularization(
-                        loss, embeddings, logits, task.linear_layer)
+            for _ in range(min_batches):
+                losses = []
 
-                optimizer.step()
+                for i, task in enumerate(tasks):
+                    optimizer.zero_grad()
+                    try:
+                        batch = next(dataloader_iters[i])
+                    except StopIteration:
+                        continue
 
-                train_loss += loss.item()
+                    predict_args, b_labels = get_input_labels(batch, task.single_sentence)
+                    logits = task.predictor(*predict_args)
+                    loss = apply_smart(task, predict_args, logits, b_labels, model) 
+                    losses.append(loss)
+
+                assert len(losses) == num_tasks
+                optimizer.pc_backward(losses) 
+                optimizer.step()  
+
+                train_loss += sum(loss.item() for loss in losses)
                 num_batches += 1
+        else:
+            for task in tasks:
+                for batch in tqdm(task.dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
+                    optimizer.zero_grad()
+                    predict_args, b_labels = get_input_labels(batch, task.single_sentence)
+                    logits = task.predictor(*predict_args)
+                    loss = apply_smart(task, predict_args, logits, b_labels, model) 
+                    loss.backward()
+                    optimizer.step()
+                    train_loss += loss.item()
+                    num_batches += 1
 
         train_loss = train_loss / (num_batches)
         print("training done")
@@ -463,6 +494,9 @@ def get_args():
 
     parser.add_argument("--use_smart", type=str,
                         help="use SMART optimization", default="True")
+    
+    parser.add_argument("--gradient_surgery", type=str,
+                        help="use gradient surgery", default="True")
 
     args = parser.parse_args()
     return args
@@ -472,7 +506,8 @@ if __name__ == "__main__":
     args = get_args()
     # Save path.
     args.intermediate_eval = args.intermediate_eval.lower() == "true"
-    args.use_smart = args.intermediate_eval.lower() == "true"
+    args.use_smart = args.use_smart.lower() == "true"
+    args.gradient_surgergy = args.gradient_surgery.lower() == "true"
 
     args.filepath = f'{args.fine_tune_mode}-{args.epochs}-{args.lr}-multitask.pt'
     seed_everything(args.seed)  # Fix the seed for reproducibility.
