@@ -8,37 +8,23 @@ import copy
 import random
 
 
-class PCGrad():
+class PCGrad(torch.optim.Optimizer):
     def __init__(self, optimizer, reduction='mean'):
-        self._optim, self._reduction = optimizer, reduction
-        return
+        self._optim = optimizer
+        self._reduction = reduction
+        super().__init__(optimizer.param_groups, optimizer.defaults)
 
     @property
     def optimizer(self):
         return self._optim
 
     def zero_grad(self):
-        '''
-        clear the gradient of the parameters
-        '''
-
         return self._optim.zero_grad(set_to_none=True)
 
     def step(self):
-        '''
-        update the parameters with the gradient
-        '''
-
         return self._optim.step()
 
     def pc_backward(self, objectives):
-        '''
-        calculate the gradient of the parameters
-
-        input:
-        - objectives: a list of objectives
-        '''
-
         grads, shapes, has_grads = self._pack_grad(objectives)
         pc_grad = self._project_conflicting(grads, has_grads)
         pc_grad = self._unflatten_grad(pc_grad, shapes[0])
@@ -81,15 +67,6 @@ class PCGrad():
         return
 
     def _pack_grad(self, objectives):
-        '''
-        pack the gradient of the parameters of the network for each objective
-        
-        output:
-        - grad: a list of the gradient of the parameters
-        - shape: a list of the shape of the parameters
-        - has_grad: a list of mask represent whether the parameter has gradient
-        '''
-
         grads, shapes, has_grads = [], [], []
         for obj in objectives:
             self._optim.zero_grad(set_to_none=True)
@@ -113,16 +90,6 @@ class PCGrad():
         return flatten_grad
 
     def _retrieve_grad(self):
-        '''
-        get the gradient of the parameters of the network with specific 
-        objective
-        
-        output:
-        - grad: a list of the gradient of the parameters
-        - shape: a list of the shape of the parameters
-        - has_grad: a list of mask represent whether the parameter has gradient
-        '''
-
         grad, shape, has_grad = [], [], []
         for group in self._optim.param_groups:
             for p in group['params']:
@@ -137,57 +104,3 @@ class PCGrad():
                 grad.append(p.grad.clone())
                 has_grad.append(torch.ones_like(p).to(p.device))
         return grad, shape, has_grad
-
-
-class TestNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self._linear = nn.Linear(3, 4)
-
-    def forward(self, x):
-        return self._linear(x)
-
-
-class MultiHeadTestNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self._linear = nn.Linear(3, 2)
-        self._head1 = nn.Linear(2, 4)
-        self._head2 = nn.Linear(2, 4)
-
-    def forward(self, x):
-        feat = self._linear(x)
-        return self._head1(feat), self._head2(feat)
-
-
-if __name__ == '__main__':
-
-    # fully shared network test
-    torch.manual_seed(4)
-    x, y = torch.randn(2, 3), torch.randn(2, 4)
-    net = TestNet()
-    y_pred = net(x)
-    pc_adam = PCGrad(optim.Adam(net.parameters()))
-    pc_adam.zero_grad()
-    loss1_fn, loss2_fn = nn.L1Loss(), nn.MSELoss()
-    loss1, loss2 = loss1_fn(y_pred, y), loss2_fn(y_pred, y)
-
-    pc_adam.pc_backward([loss1, loss2])
-    for p in net.parameters():
-        print(p.grad)
-
-    print('-' * 80)
-    # seperated shared network test
-
-    torch.manual_seed(4)
-    x, y = torch.randn(2, 3), torch.randn(2, 4)
-    net = MultiHeadTestNet()
-    y_pred_1, y_pred_2 = net(x)
-    pc_adam = PCGrad(optim.Adam(net.parameters()))
-    pc_adam.zero_grad()
-    loss1_fn, loss2_fn = nn.MSELoss(), nn.MSELoss()
-    loss1, loss2 = loss1_fn(y_pred_1, y), loss2_fn(y_pred_2, y)
-
-    pc_adam.pc_backward([loss1, loss2])
-    for p in net.parameters():
-        print(p.grad)

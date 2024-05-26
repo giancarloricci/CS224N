@@ -21,7 +21,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
+# import adapters
 from bert import BertModel
 from optimizer import AdamW
 from tqdm import tqdm
@@ -237,6 +237,9 @@ def train_multitask(args):
 
     model = MultitaskBERT(config)
     model = model.to(device)
+    if args.lora:
+        model.bert.add_adapter("custom_lora_adapter", config="lora")
+        model.bert.train_adapter("custom_lora_adapter")
 
     lr = args.lr
     optimizer = AdamW(model.parameters(), lr=lr)
@@ -274,13 +277,16 @@ def train_multitask(args):
     tasks = [task_sst, task_para, task_sts]
     num_tasks = len(tasks)
     best_dev_acc = 0
+    # save_model(model, optimizer, args, config, args.filepath)
 
     def apply_smart(task, predict_args, logits, b_labels, model):
         if args.use_smart:
-            x = predict_args if task.single_sentence else model.combined_inputs(*predict_args)
+            x = predict_args if task.single_sentence else model.combined_inputs(
+                *predict_args)
             embeddings = model.forward(*x)
             logits = task.linear_layer(embeddings)
-            loss = smart_regularization(task.loss_function(logits, b_labels), embeddings, logits, task.linear_layer)
+            loss = smart_regularization(task.loss_function(
+                logits, b_labels), embeddings, logits, task.linear_layer)
             return loss
         else:
             return task.loss_function(logits, b_labels)
@@ -294,34 +300,40 @@ def train_multitask(args):
             min_batches = min(len(task.dataloader) for task in tasks)
             dataloader_iters = [iter(task.dataloader) for task in tasks]
 
-            for _ in range(min_batches):
-                losses = []
+            with tqdm(total=min_batches) as pbar:
+                for _ in range(min_batches):
+                    losses = []
 
-                for i, task in enumerate(tasks):
-                    optimizer.zero_grad()
-                    try:
-                        batch = next(dataloader_iters[i])
-                    except StopIteration:
-                        continue
+                    for i, task in enumerate(tasks):
+                        optimizer.zero_grad()
+                        try:
+                            batch = next(dataloader_iters[i])
+                        except StopIteration:
+                            continue
 
-                    predict_args, b_labels = get_input_labels(batch, task.single_sentence)
-                    logits = task.predictor(*predict_args)
-                    loss = apply_smart(task, predict_args, logits, b_labels, model) 
-                    losses.append(loss)
+                        predict_args, b_labels = get_input_labels(
+                            batch, task.single_sentence)
+                        logits = task.predictor(*predict_args)
+                        loss = apply_smart(task, predict_args,
+                                        logits, b_labels, model)
+                        losses.append(loss)
 
-                assert len(losses) == num_tasks
-                optimizer.pc_backward(losses) 
-                optimizer.step()  
+                    assert len(losses) == num_tasks
+                    optimizer.pc_backward(losses)
+                    optimizer.step()
 
-                train_loss += sum(loss.item() for loss in losses)
-                num_batches += 1
+                    train_loss += sum(loss.item() for loss in losses)
+                    num_batches += 1
+                    pbar.update(1)
         else:
             for task in tasks:
                 for batch in tqdm(task.dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
                     optimizer.zero_grad()
-                    predict_args, b_labels = get_input_labels(batch, task.single_sentence)
+                    predict_args, b_labels = get_input_labels(
+                        batch, task.single_sentence)
                     logits = task.predictor(*predict_args)
-                    loss = apply_smart(task, predict_args, logits, b_labels, model) 
+                    loss = apply_smart(task, predict_args,
+                                       logits, b_labels, model)
                     loss.backward()
                     optimizer.step()
                     train_loss += loss.item()
@@ -345,7 +357,10 @@ def train_multitask(args):
 
             print(
                 f"Epoch {epoch} : train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f}")
-
+            
+        if args.always_save:
+            save_model(model, optimizer, args, config, args.filepath)
+            
     if not args.intermediate_eval:
         save_model(model, optimizer, args, config, args.filepath)
 
@@ -490,13 +505,19 @@ def get_args():
                         help="learning rate", default="False")
 
     parser.add_argument("--intermediate_eval", type=str,
-                        help="evaluate every epoch", default="False")
+                        help="evaluate every epoch", default="True")
 
     parser.add_argument("--use_smart", type=str,
                         help="use SMART optimization", default="True")
-    
+
     parser.add_argument("--gradient_surgery", type=str,
                         help="use gradient surgery", default="True")
+
+    parser.add_argument("--lora", type=str,
+                        help="use lora", default="False")
+
+    parser.add_argument("--always_save", type=str,
+                        help="save model after each epoch", default="False")
 
     args = parser.parse_args()
     return args
@@ -508,7 +529,8 @@ if __name__ == "__main__":
     args.intermediate_eval = args.intermediate_eval.lower() == "true"
     args.use_smart = args.use_smart.lower() == "true"
     args.gradient_surgergy = args.gradient_surgery.lower() == "true"
-
+    args.lora = args.lora.lower() == "true"
+    args.always_save = args.always_save.lower() == "true"
     args.filepath = f'{args.fine_tune_mode}-{args.epochs}-{args.lr}-multitask.pt'
     seed_everything(args.seed)  # Fix the seed for reproducibility.
     train_multitask(args)
