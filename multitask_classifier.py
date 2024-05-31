@@ -348,9 +348,8 @@ def train_multitask(args):
                             predict_args, b_labels = get_input_labels(
                                 batch, task.single_sentence)
                             logits = task.predictor(*predict_args)
-                            # loss = apply_smart(task, predict_args,
-                            #                 logits, b_labels, model)
-                            task.loss_function(logits, b_labels)
+                            loss = apply_smart(task, predict_args,
+                                            logits, b_labels, model)
                             losses.append(loss)
 
                         assert len(losses) == num_tasks
