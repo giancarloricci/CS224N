@@ -21,7 +21,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-# import adapters
 from bert import BertModel
 from optimizer import AdamW
 from tqdm import tqdm
@@ -30,6 +29,7 @@ from gradient_surgery import PCGrad
 
 from tokenizer import BertTokenizer
 from smart_regularization import smart_regularization
+from bpp import BPP
 
 from datasets import (
     SentenceClassificationDataset,
@@ -83,8 +83,13 @@ class MultitaskBERT(nn.Module):
         # You will want to add layers here to perform the downstream tasks.
         self.ln_sentiment = nn.Linear(
             in_features=config.hidden_size, out_features=5)
-        self.ln_paraphrase = nn.Linear(
-            in_features=config.hidden_size, out_features=1)
+        # self.ln_paraphrase = nn.Linear(
+        #     in_features=config.hidden_size, out_features=1)
+        self.dropout_paraphrase = nn.ModuleList([nn.Dropout(
+            config.hidden_dropout_prob) for _ in range(config.n_hidden_layers + 1)])
+        self.ln_paraphrase = nn.ModuleList([nn.Linear(BERT_HIDDEN_SIZE, BERT_HIDDEN_SIZE) for _ in range(
+            config.n_hidden_layers)] + [nn.Linear(BERT_HIDDEN_SIZE, 1)])
+
         self.ln_similarity = nn.Linear(
             in_features=config.hidden_size, out_features=1)
         self.dropout = nn.Dropout(p=config.hidden_dropout_prob)
@@ -122,17 +127,36 @@ class MultitaskBERT(nn.Module):
             batch_sep_token_id), attention_mask_2, torch.ones_like(batch_sep_token_id)), dim=1)
         return input_id, attention_mask
 
+    # def predict_paraphrase(self,
+    #                        input_ids_1, attention_mask_1,
+    #                        input_ids_2, attention_mask_2):
+    #     '''Given a batch of pairs of sentences, outputs a single logit for predicting whether they are paraphrases.
+    #     Note that your output should be unnormaalized (a logit); it will be passed to the sigmoid function
+    #     during evaluation.
+    #     '''
+    #     input_id, attention_mask = self.combined_inputs(
+    #         input_ids_1, attention_mask_1, input_ids_2, attention_mask_2)
+    #     out = self.forward(input_id, attention_mask)
+    #     return self.ln_paraphrase(out)
+
+    def forward_paraphrase(self, x):
+        for i in range(len(self.ln_paraphrase) - 1):
+            x = self.dropout_paraphrase[i](x)
+            x = self.ln_paraphrase[i](x)
+            x = F.relu(x)
+
+        x = self.dropout_paraphrase[-1](x)
+        logits = self.ln_paraphrase[-1](x)
+        return logits
+
     def predict_paraphrase(self,
                            input_ids_1, attention_mask_1,
                            input_ids_2, attention_mask_2):
-        '''Given a batch of pairs of sentences, outputs a single logit for predicting whether they are paraphrases.
-        Note that your output should be unnormaalized (a logit); it will be passed to the sigmoid function
-        during evaluation.
-        '''
         input_id, attention_mask = self.combined_inputs(
             input_ids_1, attention_mask_1, input_ids_2, attention_mask_2)
+
         out = self.forward(input_id, attention_mask)
-        return self.ln_paraphrase(out)
+        return self.forward_paraphrase(out)
 
     def predict_similarity(self,
                            input_ids_1, attention_mask_1,
@@ -226,20 +250,30 @@ def train_multitask(args):
                 lambda x: x.to(device), (b_ids_1, b_mask_1, b_ids_2, b_mask_2, b_labels))
             return (b_ids_1, b_mask_1, b_ids_2, b_mask_2), b_labels
 
-    # Init model.
-    config = {'hidden_dropout_prob': args.hidden_dropout_prob,
-              'num_labels': num_labels,
-              'hidden_size': 768,
-              'data_dir': '.',
-              'fine_tune_mode': args.fine_tune_mode}
+    if args.load_model:
+        saved = torch.load(args.load_filepath)
+        config = saved['model_config']
+        model = MultitaskBERT(config)
+        model.load_state_dict(saved['model'])
+        model = model.to(device)
+        print(f"Loaded model to test from {args.load_filepath}")
 
-    config = SimpleNamespace(**config)
+    else:
+        # Init model.
+        config = {'hidden_dropout_prob': args.hidden_dropout_prob,
+                  'num_labels': num_labels,
+                  'hidden_size': 768,
+                  'data_dir': '.',
+                  'fine_tune_mode': args.fine_tune_mode,
+                  "n_hidden_layers": args.n_hidden_layers
+                  }
 
-    model = MultitaskBERT(config)
-    model = model.to(device)
-    if args.lora:
-        model.bert.add_adapter("custom_lora_adapter", config="lora")
-        model.bert.train_adapter("custom_lora_adapter")
+        config = SimpleNamespace(**config)
+
+        model = MultitaskBERT(config)
+        model = model.to(device)
+        if args.use_smart == 0:
+            bpp = BPP(model, beta=0.8, mu=1)
 
     lr = args.lr
     optimizer = AdamW(model.parameters(), lr=lr)
@@ -277,10 +311,9 @@ def train_multitask(args):
     tasks = [task_sst, task_para, task_sts]
     num_tasks = len(tasks)
     best_dev_acc = 0
-    # save_model(model, optimizer, args, config, args.filepath)
 
     def apply_smart(task, predict_args, logits, b_labels, model):
-        if args.use_smart:
+        if args.use_smart == 0:
             x = predict_args if task.single_sentence else model.combined_inputs(
                 *predict_args)
             embeddings = model.forward(*x)
@@ -297,34 +330,174 @@ def train_multitask(args):
         num_batches = 0
 
         if args.gradient_surgery:
-            min_batches = min(len(task.dataloader) for task in tasks)
-            dataloader_iters = [iter(task.dataloader) for task in tasks]
+            if args.surgery_mode == 0:
+                min_batches = min(len(task.dataloader) for task in tasks)
+                dataloader_iters = [iter(task.dataloader) for task in tasks]
 
-            with tqdm(total=min_batches) as pbar:
-                for _ in range(min_batches):
-                    losses = []
+                with tqdm(total=min_batches) as pbar:
+                    for _ in range(min_batches):
+                        losses = []
 
-                    for i, task in enumerate(tasks):
+                        for i, task in enumerate(tasks):
+                            optimizer.zero_grad()
+                            try:
+                                batch = next(dataloader_iters[i])
+                            except StopIteration:
+                                continue
+
+                            predict_args, b_labels = get_input_labels(
+                                batch, task.single_sentence)
+                            logits = task.predictor(*predict_args)
+                            # loss = apply_smart(task, predict_args,
+                            #                 logits, b_labels, model)
+                            task.loss_function(logits, b_labels)
+                            losses.append(loss)
+
+                        assert len(losses) == num_tasks
+                        optimizer.pc_backward(losses)
+
+                        if args.use_smart == 0 and args.smart_bpp == 0:
+                            bregman_loss = bpp.mu * \
+                                bpp.bregman_divergence(
+                                    predict_args, logits, task)
+                            bregman_loss.backward()
+
+                        optimizer.step()
+
+                        if args.use_smart == 0 and args.smart_bpp == 0:
+                            bpp.theta_til_backup(model.named_parameters())
+
+                        train_loss += sum(loss.item() for loss in losses)
+                        num_batches += 1
+                        pbar.update(1)
+
+            elif args.surgery_mode == 1:
+                dataloader_iters = [iter(task.dataloader) for task in tasks]
+
+                if args.continue_surg:
+                    min_batches = min(len(task.dataloader) for task in tasks)
+                    with tqdm(total=min_batches) as pbar:
+                        for _ in range(min_batches):
+                            losses = []
+
+                            for i, task in enumerate(tasks):
+                                optimizer.zero_grad()
+                                try:
+                                    batch = next(dataloader_iters[i])
+                                except StopIteration:
+                                    continue
+
+                                predict_args, b_labels = get_input_labels(
+                                    batch, task.single_sentence)
+                                logits = task.predictor(*predict_args)
+                                loss = apply_smart(task, predict_args,
+                                                   logits, b_labels, model)
+                                losses.append(loss)
+
+                            assert len(losses) == num_tasks
+                            optimizer.pc_backward(losses)
+                            optimizer.step()
+
+                            train_loss += sum(loss.item() for loss in losses)
+                            num_batches += 1
+                            pbar.update(1)
+
+                if args.surg_debug:
+                    # disable everything but us
+                    if args.disable_bert == 0:
+                        for param in model.bert.parameters():
+                            param.requires_grad = False
+                        for param in model.ln_sentiment.parameters():
+                            param.requires_grad = False
+                        for param in model.ln_similarity.parameters():
+                            param.requires_grad = False
+
+                    if args.disable_bert == 1:
+                        for param in model.ln_sentiment.parameters():
+                            param.requires_grad = False
+
+                    if args.disable_bert == 2:
+                        for param in model.bert.parameters():
+                            param.requires_grad = False
+                        for param in model.ln_sentiment.parameters():
+                            param.requires_grad = False
+
+                    dataloader_iter_para = iter(tasks[1].dataloader)
+                    para_batches = args.para_size
+                    if args.use_max_para:
+                        para_batches = len(dataloader_iter_para) - num_batches
+
+                    for _ in tqdm(range(para_batches), desc=f'train-{epoch}', disable=TQDM_DISABLE):
                         optimizer.zero_grad()
                         try:
-                            batch = next(dataloader_iters[i])
+                            batch = next(dataloader_iter_para)
                         except StopIteration:
-                            continue
+                            break
 
                         predict_args, b_labels = get_input_labels(
-                            batch, task.single_sentence)
-                        logits = task.predictor(*predict_args)
-                        loss = apply_smart(task, predict_args,
-                                        logits, b_labels, model)
-                        losses.append(loss)
+                            batch, tasks[1].single_sentence)
+                        logits = tasks[1].predictor(*predict_args)
+                        loss = apply_smart(tasks[1], predict_args,
+                                           logits, b_labels, model)
+                        loss = loss * args.penalty_factor2
+                        if args.pc_test:
+                            loss.backward()
+                        else:
+                            losses = [loss]
+                            optimizer.pc_backward(losses)
 
-                    assert len(losses) == num_tasks
-                    optimizer.pc_backward(losses)
-                    optimizer.step()
+                        optimizer.step()
+                        train_loss += loss.item()
+                        num_batches += 1
 
-                    train_loss += sum(loss.item() for loss in losses)
-                    num_batches += 1
-                    pbar.update(1)
+                    for param in model.parameters():
+                        param.requires_grad = True
+                    for param in model.ln_sentiment.parameters():
+                        param.requires_grad = True
+                    for param in model.ln_similarity.parameters():
+                        param.requires_grad = True
+
+                    if args.do_sentiment:
+                        for param in model.bert.parameters():
+                            param.requires_grad = False
+                        for param in model.ln_paraphrase.parameters():
+                            param.requires_grad = False
+                        for param in model.ln_similarity.parameters():
+                            param.requires_grad = False
+
+                        dataloader_iter_sim = dataloader_iters[0]
+                        sim_batches = len(dataloader_iter_sim) - min_batches
+
+                        for _ in tqdm(range(sim_batches), desc=f'train-{epoch}', disable=TQDM_DISABLE):
+                            optimizer.zero_grad()
+                            try:
+                                batch = next(dataloader_iter_sim)
+                            except StopIteration:
+                                break
+
+                            predict_args, b_labels = get_input_labels(
+                                batch, tasks[0].single_sentence)
+                            logits = tasks[0].predictor(*predict_args)
+                            loss = apply_smart(tasks[0], predict_args,
+                                               logits, b_labels, model)
+
+                            loss = loss * args.penalty_factor2
+                            if args.pc_test:
+                                loss.backward()
+                            else:
+                                losses = [loss]
+                                optimizer.pc_backward(losses)
+
+                            optimizer.step()
+                            train_loss += loss.item()
+                            num_batches += 1
+
+                        for param in model.parameters():
+                            param.requires_grad = True
+                        for param in model.ln_sentiment.parameters():
+                            param.requires_grad = True
+                        for param in model.ln_similarity.parameters():
+                            param.requires_grad = True
         else:
             for task in tasks:
                 for batch in tqdm(task.dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
@@ -343,24 +516,33 @@ def train_multitask(args):
         print("training done")
 
         if args.intermediate_eval:
-            train_acc, train_f1, *_ = model_eval_multitask(
-                sst_train_dataloader, para_train_dataloader, sts_train_dataloader,
-                model, device
-            )
-            dev_acc, dev_f1, *_ = model_eval_multitask(
-                sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader,
-                model, device
-            )
+            if args.include_train:
+                train_acc, train_f1, *_ = model_eval_multitask(
+                    sst_train_dataloader, para_train_dataloader, sts_train_dataloader,
+                    model, device
+                )
+
+            dev_sentiment_accuracy, dev_sst_y_pred, dev_sst_sent_ids, \
+                dev_paraphrase_accuracy, dev_para_y_pred, dev_para_sent_ids, \
+                dev_sts_corr, dev_sts_y_pred, dev_sts_sent_ids = model_eval_multitask(sst_dev_dataloader,
+                                                                                      para_dev_dataloader,
+                                                                                      sts_dev_dataloader, model, device)
+
+            dev_acc = (dev_sentiment_accuracy +
+                       dev_paraphrase_accuracy + (0.5 * dev_sts_corr + 0.5)) / 3
             if dev_acc > best_dev_acc:
                 best_dev_acc = dev_acc
                 save_model(model, optimizer, args, config, args.filepath)
+            if args.include_train:
+                print(
+                    f"Epoch {epoch} : train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f}")
+            else:
+                print(
+                    f"Epoch {epoch} : dev acc :: {dev_acc :.3f}")
 
-            print(
-                f"Epoch {epoch} : train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f}")
-            
         if args.always_save:
             save_model(model, optimizer, args, config, args.filepath)
-            
+
     if not args.intermediate_eval:
         save_model(model, optimizer, args, config, args.filepath)
 
@@ -416,11 +598,12 @@ def test_multitask(args):
                                                                                   para_dev_dataloader,
                                                                                   sts_dev_dataloader, model, device)
 
-        test_sst_y_pred, \
-            test_sst_sent_ids, test_para_y_pred, test_para_sent_ids, test_sts_y_pred, test_sts_sent_ids = \
-            model_eval_test_multitask(sst_test_dataloader,
-                                      para_test_dataloader,
-                                      sts_test_dataloader, model, device)
+        if args.include_test:
+            test_sst_y_pred, \
+                test_sst_sent_ids, test_para_y_pred, test_para_sent_ids, test_sts_y_pred, test_sts_sent_ids = \
+                model_eval_test_multitask(sst_test_dataloader,
+                                          para_test_dataloader,
+                                          sts_test_dataloader, model, device)
 
         with open(args.sst_dev_out, "w+") as f:
             print(f"dev sentiment acc :: {dev_sentiment_accuracy :.3f}")
@@ -428,10 +611,11 @@ def test_multitask(args):
             for p, s in zip(dev_sst_sent_ids, dev_sst_y_pred):
                 f.write(f"{p} , {s} \n")
 
-        with open(args.sst_test_out, "w+") as f:
-            f.write(f"id \t Predicted_Sentiment \n")
-            for p, s in zip(test_sst_sent_ids, test_sst_y_pred):
-                f.write(f"{p} , {s} \n")
+        if args.include_test:
+            with open(args.sst_test_out, "w+") as f:
+                f.write(f"id \t Predicted_Sentiment \n")
+                for p, s in zip(test_sst_sent_ids, test_sst_y_pred):
+                    f.write(f"{p} , {s} \n")
 
         with open(args.para_dev_out, "w+") as f:
             print(f"dev paraphrase acc :: {dev_paraphrase_accuracy :.3f}")
@@ -439,10 +623,11 @@ def test_multitask(args):
             for p, s in zip(dev_para_sent_ids, dev_para_y_pred):
                 f.write(f"{p} , {s} \n")
 
-        with open(args.para_test_out, "w+") as f:
-            f.write(f"id \t Predicted_Is_Paraphrase \n")
-            for p, s in zip(test_para_sent_ids, test_para_y_pred):
-                f.write(f"{p} , {s} \n")
+        if args.include_test:
+            with open(args.para_test_out, "w+") as f:
+                f.write(f"id \t Predicted_Is_Paraphrase \n")
+                for p, s in zip(test_para_sent_ids, test_para_y_pred):
+                    f.write(f"{p} , {s} \n")
 
         with open(args.sts_dev_out, "w+") as f:
             print(f"dev sts corr :: {dev_sts_corr :.3f}")
@@ -450,10 +635,11 @@ def test_multitask(args):
             for p, s in zip(dev_sts_sent_ids, dev_sts_y_pred):
                 f.write(f"{p} , {s} \n")
 
-        with open(args.sts_test_out, "w+") as f:
-            f.write(f"id \t Predicted_Similiary \n")
-            for p, s in zip(test_sts_sent_ids, test_sts_y_pred):
-                f.write(f"{p} , {s} \n")
+        if args.include_test:
+            with open(args.sts_test_out, "w+") as f:
+                f.write(f"id \t Predicted_Similiary \n")
+                for p, s in zip(test_sts_sent_ids, test_sts_y_pred):
+                    f.write(f"{p} , {s} \n")
 
 
 def get_args():
@@ -507,17 +693,68 @@ def get_args():
     parser.add_argument("--intermediate_eval", type=str,
                         help="evaluate every epoch", default="True")
 
-    parser.add_argument("--use_smart", type=str,
-                        help="use SMART optimization", default="True")
+    parser.add_argument("--use_smart", type=int,
+                        help="use SMART optimization", default=1)
+
+    parser.add_argument("--train", type=str,
+                        help="use SMART optimization", default="true")
+
+    parser.add_argument("--smart_bpp", type=int,
+                        help="use SMART optimization", default=0)
 
     parser.add_argument("--gradient_surgery", type=str,
                         help="use gradient surgery", default="True")
 
-    parser.add_argument("--lora", type=str,
-                        help="use lora", default="False")
-
     parser.add_argument("--always_save", type=str,
                         help="save model after each epoch", default="False")
+
+    parser.add_argument("--surgery_mode", type=int,
+                        help="surgery mode", default=1)
+
+    parser.add_argument("--para_size", type=int,
+                        help="how much of paraphrase to use", default=1000)
+
+    parser.add_argument("--disable_bert", type=int,
+                        help="toggle disable when not all, just one, or not at all", default=0)
+
+    parser.add_argument("--penalty_factor1", type=float,
+                        help="", default=0.3)
+
+    parser.add_argument("--penalty_factor2", type=float,
+                        help="", default=1)
+
+    parser.add_argument("--surg_debug", type=str,
+                        help="", default="True")
+
+    parser.add_argument("--include_test", type=str,
+                        help="", default="True")
+
+    parser.add_argument("--pc_test", type=str,
+                        help="", default="True")
+
+    parser.add_argument("--use_max_para", type=str,
+                        help="", default="True")
+
+    parser.add_argument("--do_sentiment", type=str,
+                        help="", default="False")
+
+    parser.add_argument("--include_train", type=str,
+                        help="", default="False")
+
+    parser.add_argument("--cutoff", type=int,
+                        help="", default=0)
+
+    parser.add_argument("--load_model", type=str,
+                        help="", default="False")
+
+    parser.add_argument("--load_filepath", type=str,
+                        help="", default="full-model-9-1e-05-multitask.pt")
+
+    parser.add_argument("--continue_surg", type=str,
+                        help="", default="false")
+
+    parser.add_argument("--n_hidden_layers", type=int,
+                        help="", default=2)
 
     args = parser.parse_args()
     return args
@@ -527,11 +764,23 @@ if __name__ == "__main__":
     args = get_args()
     # Save path.
     args.intermediate_eval = args.intermediate_eval.lower() == "true"
-    args.use_smart = args.use_smart.lower() == "true"
+    args.include_train = args.include_train.lower() == "true"
+    args.load_model = args.load_model.lower() == "true"
+    args.continue_surg = args.continue_surg.lower() == "true"
+    args.surg_debug = args.surg_debug.lower() == "true"
+    args.include_test = args.include_test.lower() == "true"
+    args.train = args.train.lower() == "true"
     args.gradient_surgergy = args.gradient_surgery.lower() == "true"
-    args.lora = args.lora.lower() == "true"
+    args.use_max_para = args.use_max_para.lower() == "true"
+    args.pc_test = args.pc_test.lower() == "true"
+    args.do_sentiment = args.do_sentiment.lower() == "true"
     args.always_save = args.always_save.lower() == "true"
     args.filepath = f'{args.fine_tune_mode}-{args.epochs}-{args.lr}-multitask.pt'
     seed_everything(args.seed)  # Fix the seed for reproducibility.
-    train_multitask(args)
+
+    if args.train:
+        train_multitask(args)
+    else:
+        args.filepath = args.load_filepath
+
     test_multitask(args)
