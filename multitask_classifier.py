@@ -28,7 +28,6 @@ from tqdm import tqdm
 from gradient_surgery import PCGrad
 
 from tokenizer import BertTokenizer
-from smart_regularization import smart_regularization
 
 from datasets import (
     SentenceClassificationDataset,
@@ -82,10 +81,8 @@ class MultitaskBERT(nn.Module):
         # You will want to add layers here to perform the downstream tasks.
         self.ln_sentiment = nn.Linear(
             in_features=config.hidden_size, out_features=5)
-        self.dropout_paraphrase = nn.ModuleList([nn.Dropout(
-            config.hidden_dropout_prob) for _ in range(config.n_hidden_layers + 1)])
-        self.ln_paraphrase = nn.ModuleList([nn.Linear(BERT_HIDDEN_SIZE, BERT_HIDDEN_SIZE) for _ in range(
-            config.n_hidden_layers)] + [nn.Linear(BERT_HIDDEN_SIZE, 1)])
+        self.ln_paraphrase = nn.Linear(
+            in_features=config.hidden_size, out_features=1)
 
         self.ln_similarity = nn.Linear(
             in_features=config.hidden_size, out_features=1)
@@ -124,36 +121,32 @@ class MultitaskBERT(nn.Module):
             batch_sep_token_id), attention_mask_2, torch.ones_like(batch_sep_token_id)), dim=1)
         return input_id, attention_mask
 
-    def forward_paraphrase(self, x):
-        for i in range(len(self.ln_paraphrase) - 1):
-            x = self.dropout_paraphrase[i](x)
-            x = self.ln_paraphrase[i](x)
-            x = F.relu(x)
-
-        x = self.dropout_paraphrase[-1](x)
-        logits = self.ln_paraphrase[-1](x)
-        return logits
+    def combined_inputs(self, input_ids_1, attention_mask_1,
+                        input_ids_2, attention_mask_2):
+        sep_token_id = torch.tensor(
+            [self.tokenizer.sep_token_id], dtype=torch.long, device=input_ids_1.device)
+        batch_sep_token_id = sep_token_id.repeat(input_ids_1.shape[0], 1)
+        input_id = torch.cat(
+            (input_ids_1, batch_sep_token_id, input_ids_2, batch_sep_token_id), dim=1)
+        attention_mask = torch.cat((attention_mask_1, torch.ones_like(
+            batch_sep_token_id), attention_mask_2, torch.ones_like(batch_sep_token_id)), dim=1)
+        return input_id, attention_mask
 
     def predict_paraphrase(self,
                            input_ids_1, attention_mask_1,
                            input_ids_2, attention_mask_2):
         input_id, attention_mask = self.combined_inputs(
             input_ids_1, attention_mask_1, input_ids_2, attention_mask_2)
-
         out = self.forward(input_id, attention_mask)
-        return self.forward_paraphrase(out)
+        return self.ln_paraphrase(out)
 
     def predict_similarity(self,
                            input_ids_1, attention_mask_1,
                            input_ids_2, attention_mask_2):
-        '''Given a batch of pairs of sentences, outputs a single logit corresponding to how similar they are.
-        Note that your output should be unnormalized (a logit).
-        '''
         input_id, attention_mask = self.combined_inputs(
             input_ids_1, attention_mask_1, input_ids_2, attention_mask_2)
         out = self.forward(input_id, attention_mask)
         return self.ln_similarity(out)
-
 
 def save_model(model, optimizer, args, config, filepath):
     save_info = {
@@ -305,13 +298,7 @@ def train_multitask(args):
 
     def apply_smart(task, predict_args, logits, b_labels, model):
         if args.use_smart == 0:
-            x = predict_args if task.single_sentence else model.combined_inputs(
-                *predict_args)
-            embeddings = model.forward(*x)
-            logits = task.linear_layer(embeddings)
-            loss = smart_regularization(task.loss_function(
-                logits, b_labels), embeddings, logits, task.linear_layer)
-            return loss
+            raise NotImplementedError
         else:
             return task.loss_function(logits, b_labels)
 
@@ -859,7 +846,6 @@ def get_args():
 
 if __name__ == "__main__":
     args = get_args()
-    # Save path.
     args.intermediate_eval = args.intermediate_eval.lower() == "true"
     args.weight = args.weight.lower() == "true"
     args.include_train = args.include_train.lower() == "true"
