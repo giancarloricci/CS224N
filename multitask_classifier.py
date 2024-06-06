@@ -83,7 +83,6 @@ class MultitaskBERT(nn.Module):
             in_features=config.hidden_size, out_features=5)
         self.ln_paraphrase = nn.Linear(
             in_features=config.hidden_size, out_features=1)
-
         self.ln_similarity = nn.Linear(
             in_features=config.hidden_size, out_features=1)
         self.dropout = nn.Dropout(p=config.hidden_dropout_prob)
@@ -250,8 +249,8 @@ def train_multitask(args):
 
         model = MultitaskBERT(config)
         model = model.to(device)
-        if args.use_smart == 0:
-            bpp = BPP(model, beta=0.8, mu=1)
+        # if args.use_smart == 0:
+        #     bpp = BPP(model, beta=0.8, mu=1)
 
     lr = args.lr
     optimizer = AdamW(model.parameters(), lr=lr)
