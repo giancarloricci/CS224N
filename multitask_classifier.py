@@ -29,7 +29,6 @@ from gradient_surgery import PCGrad
 
 from tokenizer import BertTokenizer
 from smart_regularization import smart_regularization
-from bpp import BPP
 
 from datasets import (
     SentenceClassificationDataset,
@@ -83,8 +82,6 @@ class MultitaskBERT(nn.Module):
         # You will want to add layers here to perform the downstream tasks.
         self.ln_sentiment = nn.Linear(
             in_features=config.hidden_size, out_features=5)
-        # self.ln_paraphrase = nn.Linear(
-        #     in_features=config.hidden_size, out_features=1)
         self.dropout_paraphrase = nn.ModuleList([nn.Dropout(
             config.hidden_dropout_prob) for _ in range(config.n_hidden_layers + 1)])
         self.ln_paraphrase = nn.ModuleList([nn.Linear(BERT_HIDDEN_SIZE, BERT_HIDDEN_SIZE) for _ in range(
@@ -126,18 +123,6 @@ class MultitaskBERT(nn.Module):
         attention_mask = torch.cat((attention_mask_1, torch.ones_like(
             batch_sep_token_id), attention_mask_2, torch.ones_like(batch_sep_token_id)), dim=1)
         return input_id, attention_mask
-
-    # def predict_paraphrase(self,
-    #                        input_ids_1, attention_mask_1,
-    #                        input_ids_2, attention_mask_2):
-    #     '''Given a batch of pairs of sentences, outputs a single logit for predicting whether they are paraphrases.
-    #     Note that your output should be unnormaalized (a logit); it will be passed to the sigmoid function
-    #     during evaluation.
-    #     '''
-    #     input_id, attention_mask = self.combined_inputs(
-    #         input_ids_1, attention_mask_1, input_ids_2, attention_mask_2)
-    #     out = self.forward(input_id, attention_mask)
-    #     return self.ln_paraphrase(out)
 
     def forward_paraphrase(self, x):
         for i in range(len(self.ln_paraphrase) - 1):
@@ -290,11 +275,17 @@ def train_multitask(args):
         model.ln_sentiment
     )
 
+    def conditional_loss(logits, b_labels):
+        loss = F.binary_cross_entropy_with_logits(
+            logits.view(-1), b_labels.float(), reduction='sum') / args.batch_size
+        if args.weight:
+            loss *= args.weight_factor
+        return loss
+
     task_para = Task(
         para_train_dataloader,
         model.predict_paraphrase,
-        lambda logits, b_labels: F.binary_cross_entropy_with_logits(
-            logits.view(-1), b_labels.float(), reduction='sum') / args.batch_size,
+        conditional_loss,
         False,
         model.ln_paraphrase
     )
@@ -331,45 +322,133 @@ def train_multitask(args):
 
         if args.gradient_surgery:
             if args.surgery_mode == 0:
-                min_batches = min(len(task.dataloader) for task in tasks)
-                dataloader_iters = [iter(task.dataloader) for task in tasks]
+                if args.sampling == 0:
+                    min_batches = min(len(task.dataloader) for task in tasks)
+                    dataloader_iters = [iter(task.dataloader) for task in tasks]
 
-                with tqdm(total=min_batches) as pbar:
-                    for _ in range(min_batches):
-                        losses = []
+                    with tqdm(total=min_batches) as pbar:
+                        for _ in range(min_batches):
+                            losses = []
 
-                        for i, task in enumerate(tasks):
-                            optimizer.zero_grad()
-                            try:
-                                batch = next(dataloader_iters[i])
-                            except StopIteration:
-                                continue
+                            for i, task in enumerate(tasks):
+                                optimizer.zero_grad()
+                                try:
+                                    batch = next(dataloader_iters[i])
+                                except StopIteration:
+                                    continue
 
-                            predict_args, b_labels = get_input_labels(
-                                batch, task.single_sentence)
-                            logits = task.predictor(*predict_args)
-                            loss = apply_smart(task, predict_args,
-                                            logits, b_labels, model)
-                            losses.append(loss)
+                                predict_args, b_labels = get_input_labels(
+                                    batch, task.single_sentence)
+                                logits = task.predictor(*predict_args)
+                                loss = apply_smart(task, predict_args,
+                                                logits, b_labels, model)
+                                losses.append(loss)
 
-                        assert len(losses) == num_tasks
-                        optimizer.pc_backward(losses)
+                            assert len(losses) == num_tasks
+                            optimizer.pc_backward(losses)
+                            optimizer.step()
 
-                        if args.use_smart == 0 and args.smart_bpp == 0:
-                            bregman_loss = bpp.mu * \
-                                bpp.bregman_divergence(
-                                    predict_args, logits, task)
-                            bregman_loss.backward()
+                            train_loss += sum(loss.item() for loss in losses)
+                            num_batches += 1
+                            pbar.update(1)
+                            
+                elif args.sampling == 1:
+                    num_epochs = args.epochs
+                    num_tasks = len(tasks)
+                    dataset_sizes = np.array([len(task.dataloader.dataset) for task in tasks])
+                      
+                    batches_per_epoch = args.num_batches
+                    alpha = 1 - 0.8 * (epoch / (num_epochs - 1))
+                        
+                    task_probabilities = dataset_sizes ** alpha
+                    task_probabilities /= task_probabilities.sum()
+                    dataloader_iters = [iter(task.dataloader) for task in tasks]
+                    if args.downsample == 1:
+                        dataloader = tasks[0].dataloader
+                        size = args.downsample_size
+                      
+                        dataloader = torch.utils.data.DataLoader(
+                                dataloader.dataset[:size],
+                                batch_size=dataloader.batch_size,
+                                shuffle=True,
+                                num_workers=dataloader.num_workers,
+                                collate_fn=dataloader.collate_fn,
+                                drop_last=dataloader.drop_last
+                        )
+                        dataloader_iters[0] = iter(dataloader)
 
-                        optimizer.step()
+                    with tqdm(total=batches_per_epoch) as pbar:
+                        for _ in range(batches_per_epoch):
+                            losses = []
+                                
+                            for _ in range(num_tasks):
+                                optimizer.zero_grad()
+                                    
+                                task_index = np.random.choice(num_tasks, p=task_probabilities)
+                                selected_task = tasks[task_index]
+                                
+                                try:
+                                    batch = next(dataloader_iters[task_index])
+                                except StopIteration:
+                                    # If the current task is exhausted, try other tasks
+                                    for other_task_index in range(num_tasks):
+                                        if other_task_index != task_index:  # Skip the current task
+                                            try:
+                                                batch = next(dataloader_iters[other_task_index])
+                                                selected_task = tasks[other_task_index]
+                                                break  # Exit the loop if a batch is successfully obtained
+                                            except StopIteration:
+                                                continue
+                                    else:
+                                        raise ValueError("All tasks have exhausted their dataloaders")
 
-                        if args.use_smart == 0 and args.smart_bpp == 0:
-                            bpp.theta_til_backup(model.named_parameters())
+                                    
+                                predict_args, b_labels = get_input_labels(batch, selected_task.single_sentence)
+                                logits = selected_task.predictor(*predict_args)
+                                loss = apply_smart(selected_task, predict_args, logits, b_labels, model)
+                                losses.append(loss)
+                                
+                            assert len(losses) == num_tasks
+                            optimizer.pc_backward(losses)
+                            optimizer.step()
+                                
+                            train_loss += sum(loss.item() for loss in losses)
+                            num_batches += 1
+                            pbar.update(1)
+                            
+                elif args.sampling == 2:
+                    dataset_sizes = [len(task.dataloader.dataset) for task in tasks]
+                    total_samples = sum(dataset_sizes)
+                    probabilities = [size / total_samples for size in dataset_sizes]
+                    dataloader_iters = [iter(task.dataloader) for task in tasks]
+                    batches_per_epoch = args.num_batches
+                    with tqdm(total=batches_per_epoch) as pbar:
+                        for _ in range(batches_per_epoch):
+                            losses = []
+                                
+                            for _ in range(num_tasks):
+                                optimizer.zero_grad()
+                                task_index = np.random.choice(num_tasks, p=probabilities)
+                                selected_task = tasks[task_index]
+                            
+                                try:
+                                    batch = next(dataloader_iters[task_index])
+                                except StopIteration:
+                                    continue
+                                
+                                predict_args, b_labels = get_input_labels(batch, selected_task.single_sentence)
+                                logits = selected_task.predictor(*predict_args)
+                                loss = apply_smart(selected_task, predict_args, logits, b_labels, model)
+                                losses.append(loss)
 
-                        train_loss += sum(loss.item() for loss in losses)
-                        num_batches += 1
-                        pbar.update(1)
-
+                            assert len(losses) == num_tasks
+                            optimizer.pc_backward(losses)
+                            optimizer.step()
+                            
+                            train_loss += sum(loss.item() for loss in losses)
+                            num_batches += 1
+                            pbar.update(1)
+                                    
             elif args.surgery_mode == 1:
                 dataloader_iters = [iter(task.dataloader) for task in tasks]
 
@@ -679,6 +758,7 @@ def get_args():
 
     parser.add_argument("--sts_dev_out", type=str,
                         default="predictions/sts-dev-output.csv")
+    
     parser.add_argument("--sts_test_out", type=str,
                         default="predictions/sts-test-output.csv")
 
@@ -694,6 +774,24 @@ def get_args():
 
     parser.add_argument("--use_smart", type=int,
                         help="use SMART optimization", default=1)
+    
+    parser.add_argument("--weight", type=str,
+                        help="weight", default="true")
+    
+    parser.add_argument("--sampling", type=int,
+                        help="weight", default=0)
+    
+    parser.add_argument("--num_batches", type=int,
+                        help="weight", default=12000)
+    
+    parser.add_argument("--weight_factor", type=float,
+                        help="weight", default=1)
+      
+    parser.add_argument("--downsample", type=int,
+                        help="weight", default=1)
+    
+    parser.add_argument("--downsample_size", type=int,
+                        help="weight", default=10000)
 
     parser.add_argument("--train", type=str,
                         help="use SMART optimization", default="true")
@@ -753,7 +851,7 @@ def get_args():
                         help="", default="false")
 
     parser.add_argument("--n_hidden_layers", type=int,
-                        help="", default=2)
+                        help="", default=0)
 
     args = parser.parse_args()
     return args
@@ -763,6 +861,7 @@ if __name__ == "__main__":
     args = get_args()
     # Save path.
     args.intermediate_eval = args.intermediate_eval.lower() == "true"
+    args.weight = args.weight.lower() == "true"
     args.include_train = args.include_train.lower() == "true"
     args.load_model = args.load_model.lower() == "true"
     args.continue_surg = args.continue_surg.lower() == "true"
@@ -774,7 +873,7 @@ if __name__ == "__main__":
     args.pc_test = args.pc_test.lower() == "true"
     args.do_sentiment = args.do_sentiment.lower() == "true"
     args.always_save = args.always_save.lower() == "true"
-    args.filepath = f'{args.fine_tune_mode}-{args.epochs}-{args.lr}-multitask.pt'
+    args.filepath = f'{args.fine_tune_mode}-{args.epochs}-{args.lr}-{args.sampling}-multitask.pt'
     seed_everything(args.seed)  # Fix the seed for reproducibility.
 
     if args.train:

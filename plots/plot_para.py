@@ -2,35 +2,33 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
+import numpy as np
 
-# Function to plot the confusion matrix and the distribution of true categories
-def plot_confusion_matrix_with_distribution(predictions, ground_truth):
+def plot_confusion_matrix(predictions, ground_truth):
     # Calculate the confusion matrix
     cm = confusion_matrix(ground_truth, predictions)
+    
+    # Normalize the confusion matrix
+    cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
 
-    # Create a figure with subplots
-    fig, ax = plt.subplots(1, 2, figsize=(16, 6))
+    # Create a figure
+    plt.figure(figsize=(8, 6))
 
-    # Plot the confusion matrix
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Not Duplicate', 'Duplicate'], yticklabels=['Not Duplicate', 'Duplicate'], ax=ax[0])
-    ax[0].set_xlabel('Predicted')
-    ax[0].set_ylabel('Actual')
-    ax[0].set_title('Confusion Matrix')
-
-    # Plot the distribution of true categories
-    sns.countplot(x=ground_truth, palette='pastel', ax=ax[1])
-    ax[1].set_xlabel('True Label')
-    ax[1].set_ylabel('Count')
-    ax[1].set_title('Distribution of True Categories')
-    ax[1].set_xticklabels(['Not Duplicate', 'Duplicate'])
+    # Plot the normalized confusion matrix
+    sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues', xticklabels=['Not Duplicate', 'Duplicate'], yticklabels=['Not Duplicate', 'Duplicate'])
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.title('Normalized Confusion Matrix')
 
     plt.tight_layout()
+    plt.savefig("plots/plot_para.png")
     # plt.show()
-    plt.savefig("plot_para.png")
+
+# Load the CSV files and perform the necessary data processing
 
 # Load the CSV files
 true_df = pd.read_csv('data/quora-dev.csv', delimiter='\t')
-predicted_df = pd.read_csv('predictions_check/para-dev-output.csv', delimiter=',', header=None, names=['id', 'Predicted_Is_Paraphrase'])
+predicted_df = pd.read_csv('predictions/para-dev-output.csv', delimiter=',', header=None, names=['id', 'Predicted_Is_Paraphrase'])
 
 # Clean up any extraneous spaces in the column names and data
 true_df.columns = true_df.columns.str.strip()
@@ -55,5 +53,5 @@ results_df.columns = ['id', 'true_label', 'predicted_label']
 results_df['true_label'] = results_df['true_label'].astype(float).astype(int)
 results_df['predicted_label'] = results_df['predicted_label'].astype(float).astype(int)
 
-# Plot the confusion matrix and distribution with the actual data
-plot_confusion_matrix_with_distribution(results_df['predicted_label'], results_df['true_label'])
+# Call the function to plot the confusion matrix
+plot_confusion_matrix(results_df['predicted_label'], results_df['true_label'])
